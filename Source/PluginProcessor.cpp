@@ -294,11 +294,17 @@ void ResamplingDelayAudioProcessor::prepareToPlay (double sampleRate, int)
         {
             auto& line = reverbLines[channelIndex][i];
             line.baseDelaySeconds = baseTimes[i] * (channel == 0 ? 1.0f : 1.071f);
+            line.toneState = 0.0f;
+            line.deClickState = 0.0f;
+            line.tapState = 0.0f;
+            line.writeState = 0.0f;
             line.delay.prepare (sampleRate, 1, 1.2);
+            line.crusher.prepare (1);
         }
     }
 
     toneStates = {};
+    reverbWetStates = {};
     wowPhase = 0.0f;
     smoothedDelayMs = delayMs->load();
     smoothedReverbTime = reverbTime->load();
@@ -414,16 +420,20 @@ void ResamplingDelayAudioProcessor::processReverb (juce::AudioBuffer<float>& buf
                                                         1.15f * static_cast<float> (currentSampleRate),
                                                         line.baseDelaySeconds * sizeScale * static_cast<float> (currentSampleRate) + smear);
 
-                const auto tap = line.delay.read (0, delaySamples);
+                const auto rawTap = line.delay.read (0, delaySamples);
+                const auto tap = reverbSpikeGuard (line.tapState, rawTap, lofiAmount);
                 const auto diffused = softClip (input + tap * regen - tank * 0.045f);
-                const auto degraded = crush (channel, toneFilter (channel, diffused, currentTone));
-                line.delay.write (0, degraded);
+                const auto filtered = reverbToneFilter (line, diffused, currentTone);
+                const auto crushed = line.crusher.process (0, filtered, lofiAmount);
+                const auto deClicked = reverbDeClickFilter (line, crushed, lofiAmount);
+                line.delay.write (0, reverbSpikeGuard (line.writeState, deClicked, lofiAmount));
                 line.delay.advance();
                 tank += tap * (i % 2 == 0 ? 1.0f : -0.72f);
             }
 
             tank *= 0.23f;
-            data[sample] = softClip (dry * dryGain + tank * wetGain * 1.65f);
+            const auto guardedWet = reverbSpikeGuard (reverbWetStates[channelIndex], tank * 1.65f, lofiAmount);
+            data[sample] = softClip (dry * dryGain + guardedWet * wetGain);
         }
 
         wowPhase += juce::MathConstants<float>::twoPi * juce::jmap (lofiAmount, 0.05f, 0.62f)
@@ -440,6 +450,31 @@ float ResamplingDelayAudioProcessor::toneFilter (int channel, float input, float
     auto& stateValue = toneStates[static_cast<size_t> (juce::jlimit (0, 1, channel))];
     stateValue += coefficient * (input - stateValue);
     return stateValue;
+}
+
+float ResamplingDelayAudioProcessor::reverbToneFilter (ReverbLine& line, float input, float toneValue)
+{
+    const auto cutoff = juce::jmap (toneValue, 550.0f, 9000.0f);
+    const auto coefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * cutoff / static_cast<float> (currentSampleRate));
+    line.toneState += coefficient * (input - line.toneState);
+    return line.toneState;
+}
+
+float ResamplingDelayAudioProcessor::reverbDeClickFilter (ReverbLine& line, float input, float lofiAmount)
+{
+    const auto cutoff = juce::jmap (lofiAmount, 15000.0f, 3600.0f);
+    const auto coefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * cutoff / static_cast<float> (currentSampleRate));
+    line.deClickState += coefficient * (input - line.deClickState);
+    return line.deClickState;
+}
+
+float ResamplingDelayAudioProcessor::reverbSpikeGuard (float& guardState, float input, float lofiAmount)
+{
+    const auto maxDelta = juce::jmap (lofiAmount, 0.38f, 0.12f);
+    const auto delta = input - guardState;
+    const auto guarded = guardState + juce::jlimit (-maxDelta, maxDelta, delta);
+    guardState = guarded;
+    return guarded;
 }
 
 void ResamplingDelayAudioProcessor::updateSmoothedValues()

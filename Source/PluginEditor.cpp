@@ -58,14 +58,26 @@ void ResamplingDelayAudioProcessorEditor::KnobLookAndFeel::drawRotarySlider (juc
     const auto* modSlider = dynamic_cast<ResamplingDelayAudioProcessorEditor::ModSlider*> (&slider);
     const auto hasScript = modSlider != nullptr && modSlider->hasScript;
     const auto scriptActive = modSlider != nullptr && modSlider->scriptActive;
+    const auto pulse = scriptActive && modSlider != nullptr
+        ? 0.5f + 0.5f * std::sin (modSlider->pulsePhase)
+        : 0.0f;
+    const auto glowScale = scriptActive ? 1.0f + pulse * 0.42f : 1.0f;
+    const auto coreScale = scriptActive ? 1.0f + pulse * 0.12f : 1.0f;
     const auto dotColour = scriptActive ? juce::Colour (0xff42c7ff)
                                         : (hasScript ? juce::Colour (0xff276ea7) : juce::Colour (0xff193449));
-    const auto glowAlpha = scriptActive ? 0x66 : (hasScript ? 0x30 : 0x14);
+    const auto glowAlpha = scriptActive ? (juce::uint8) (0x42 + (int) (pulse * 0x34))
+                                        : (hasScript ? (juce::uint8) 0x30 : (juce::uint8) 0x14);
 
     g.setColour (dotColour.withAlpha ((juce::uint8) glowAlpha));
-    g.fillEllipse (centre.x - dotRadius * 3.1f, centre.y - dotRadius * 3.1f, dotRadius * 6.2f, dotRadius * 6.2f);
+    g.fillEllipse (centre.x - dotRadius * 3.1f * glowScale,
+                   centre.y - dotRadius * 3.1f * glowScale,
+                   dotRadius * 6.2f * glowScale,
+                   dotRadius * 6.2f * glowScale);
     g.setColour (dotColour.brighter (scriptActive ? 0.18f : 0.02f));
-    g.fillEllipse (centre.x - dotRadius, centre.y - dotRadius, dotRadius * 2.0f, dotRadius * 2.0f);
+    g.fillEllipse (centre.x - dotRadius * coreScale,
+                   centre.y - dotRadius * coreScale,
+                   dotRadius * 2.0f * coreScale,
+                   dotRadius * 2.0f * coreScale);
     g.setColour (scriptActive ? juce::Colour (0xccffffff) : juce::Colour (0x55ffffff));
     g.fillEllipse (centre.x - dotRadius * 0.40f, centre.y - dotRadius * 0.48f, dotRadius * 0.58f, dotRadius * 0.42f);
     g.setColour (juce::Colour (0x66000000));
@@ -214,6 +226,50 @@ public:
 private:
     juce::String defaultScript() const
     {
+        if (parameterId == "delayMs")
+            return "modulator delayMs\n"
+                   "  mode loop\n"
+                   "  stage 1 to 28% for 6s curve smooth\n"
+                   "  stage 2 to 72% for 9s curve smooth\n"
+                   "  stage 3 hold for 1200ms\n"
+                   "  stage 4 to 42% for 5s curve smooth\n"
+                   "end\n";
+
+        if (parameterId == "feedback")
+            return "modulator feedback\n"
+                   "  mode loop\n"
+                   "  stage 1 sine 38% 68% for 8s\n"
+                   "end\n";
+
+        if (parameterId == "reverbTime")
+            return "modulator reverbTime\n"
+                   "  mode loop\n"
+                   "  stage 1 to 35% for 7s curve smooth\n"
+                   "  stage 2 to 82% for 12s curve smooth\n"
+                   "  stage 3 to 56% for 5s curve smooth\n"
+                   "end\n";
+
+        if (parameterId == "mix")
+            return "modulator mix\n"
+                   "  mode loop\n"
+                   "  stage 1 sine 32% 58% for 10s\n"
+                   "end\n";
+
+        if (parameterId == "lofi")
+            return "modulator lofi\n"
+                   "  mode loop\n"
+                   "  stage 1 random 38% 76% for 220ms curve smooth\n"
+                   "  stage 2 random 18% 62% for 480ms curve smooth\n"
+                   "  stage 3 hold for 160ms\n"
+                   "end\n";
+
+        if (parameterId == "tone")
+            return "modulator tone\n"
+                   "  mode loop\n"
+                   "  stage 1 wander 22% 68% for 1300ms curve smooth\n"
+                   "  stage 2 sine 32% 82% for 11s\n"
+                   "end\n";
+
         return "modulator " + parameterId + "\n"
                "  mode loop\n"
                "  stage 1 random 20% 80% for 700ms curve smooth\n"
@@ -355,6 +411,21 @@ void ResamplingDelayAudioProcessorEditor::openFabricScriptEditor (const juce::St
 
 void ResamplingDelayAudioProcessorEditor::timerCallback()
 {
+    auto animatePulse = [] (ModSlider& slider)
+    {
+        if (! slider.scriptActive)
+        {
+            slider.pulsePhase = 0.0f;
+            return;
+        }
+
+        slider.pulsePhase += 0.18f;
+        if (slider.pulsePhase > juce::MathConstants<float>::twoPi)
+            slider.pulsePhase -= juce::MathConstants<float>::twoPi;
+
+        slider.repaint();
+    };
+
     updateScriptIndicator (delaySlider, "delayMs");
     updateScriptIndicator (feedbackSlider, "feedback");
     updateScriptIndicator (reverbSlider, "reverbTime");
@@ -368,6 +439,13 @@ void ResamplingDelayAudioProcessorEditor::timerCallback()
     updateModulatedSlider (mixSlider, "mix");
     updateModulatedSlider (lofiSlider, "lofi");
     updateModulatedSlider (toneSlider, "tone");
+
+    animatePulse (delaySlider);
+    animatePulse (feedbackSlider);
+    animatePulse (reverbSlider);
+    animatePulse (mixSlider);
+    animatePulse (lofiSlider);
+    animatePulse (toneSlider);
 }
 
 void ResamplingDelayAudioProcessorEditor::updateScriptIndicator (ModSlider& slider, const juce::String& parameterId)
@@ -379,6 +457,8 @@ void ResamplingDelayAudioProcessorEditor::updateScriptIndicator (ModSlider& slid
     {
         slider.hasScript = hasScript;
         slider.scriptActive = scriptActive;
+        if (! scriptActive)
+            slider.pulsePhase = 0.0f;
         slider.repaint();
     }
 }

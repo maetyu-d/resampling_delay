@@ -36,6 +36,7 @@ private:
     {
         bool hasScript = false;
         bool scriptActive = false;
+        float pulsePhase = 0.0f;
         std::function<void()> onDotClicked;
         std::function<void()> onDotDoubleClicked;
         std::function<void()> onManualDragStarted;

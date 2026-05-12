@@ -77,7 +77,12 @@ private:
     struct ReverbLine
     {
         VariableDelay delay;
+        SampleCrusher crusher;
         float baseDelaySeconds = 0.1f;
+        float toneState = 0.0f;
+        float deClickState = 0.0f;
+        float tapState = 0.0f;
+        float writeState = 0.0f;
     };
 
     struct ModStage
@@ -123,6 +128,9 @@ private:
     void processDelay (juce::AudioBuffer<float>& buffer);
     void processReverb (juce::AudioBuffer<float>& buffer);
     float toneFilter (int channel, float input, float toneValue);
+    float reverbToneFilter (ReverbLine& line, float input, float toneValue);
+    float reverbDeClickFilter (ReverbLine& line, float input, float lofiAmount);
+    float reverbSpikeGuard (float& guardState, float input, float lofiAmount);
     float crush (int channel, float input) { return crusher.process (channel, input, currentLofi); }
     void updateSmoothedValues();
     void processModulations (int numSamples);
@@ -138,6 +146,7 @@ private:
     std::array<std::array<ReverbLine, 6>, 2> reverbLines;
 
     std::array<float, 2> toneStates {};
+    std::array<float, 2> reverbWetStates {};
     std::array<float, 2> phaseOffsets { 0.0f, juce::MathConstants<float>::pi };
     double currentSampleRate = 44100.0;
     float wowPhase = 0.0f;
