@@ -26,6 +26,11 @@ float equalPowerWet (float mix)
     return std::sin (juce::MathConstants<float>::halfPi * mix);
 }
 
+float toneCutoffForValue (float toneValue)
+{
+    return 120.0f * std::pow (150.0f, juce::jlimit (0.0f, 1.0f, toneValue));
+}
+
 float parseTimeToSeconds (const juce::String& token)
 {
     const auto text = token.trim().toLowerCase();
@@ -295,6 +300,7 @@ void ResamplingDelayAudioProcessor::prepareToPlay (double sampleRate, int)
             auto& line = reverbLines[channelIndex][i];
             line.baseDelaySeconds = baseTimes[i] * (channel == 0 ? 1.0f : 1.071f);
             line.toneState = 0.0f;
+            line.toneState2 = 0.0f;
             line.deClickState = 0.0f;
             line.tapState = 0.0f;
             line.writeState = 0.0f;
@@ -304,6 +310,7 @@ void ResamplingDelayAudioProcessor::prepareToPlay (double sampleRate, int)
     }
 
     toneStates = {};
+    toneStates2 = {};
     reverbWetStates = {};
     wowPhase = 0.0f;
     smoothedDelayMs = delayMs->load();
@@ -445,19 +452,23 @@ void ResamplingDelayAudioProcessor::processReverb (juce::AudioBuffer<float>& buf
 
 float ResamplingDelayAudioProcessor::toneFilter (int channel, float input, float toneValue)
 {
-    const auto cutoff = juce::jmap (toneValue, 550.0f, 9000.0f);
+    const auto cutoff = toneCutoffForValue (toneValue);
     const auto coefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * cutoff / static_cast<float> (currentSampleRate));
-    auto& stateValue = toneStates[static_cast<size_t> (juce::jlimit (0, 1, channel))];
+    const auto stateIndex = static_cast<size_t> (juce::jlimit (0, 1, channel));
+    auto& stateValue = toneStates[stateIndex];
+    auto& stateValue2 = toneStates2[stateIndex];
     stateValue += coefficient * (input - stateValue);
-    return stateValue;
+    stateValue2 += coefficient * (stateValue - stateValue2);
+    return stateValue2;
 }
 
 float ResamplingDelayAudioProcessor::reverbToneFilter (ReverbLine& line, float input, float toneValue)
 {
-    const auto cutoff = juce::jmap (toneValue, 550.0f, 9000.0f);
+    const auto cutoff = toneCutoffForValue (toneValue);
     const auto coefficient = 1.0f - std::exp (-juce::MathConstants<float>::twoPi * cutoff / static_cast<float> (currentSampleRate));
     line.toneState += coefficient * (input - line.toneState);
-    return line.toneState;
+    line.toneState2 += coefficient * (line.toneState - line.toneState2);
+    return line.toneState2;
 }
 
 float ResamplingDelayAudioProcessor::reverbDeClickFilter (ReverbLine& line, float input, float lofiAmount)

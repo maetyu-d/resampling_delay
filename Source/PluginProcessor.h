@@ -80,6 +80,7 @@ private:
         SampleCrusher crusher;
         float baseDelaySeconds = 0.1f;
         float toneState = 0.0f;
+        float toneState2 = 0.0f;
         float deClickState = 0.0f;
         float tapState = 0.0f;
         float writeState = 0.0f;
@@ -146,6 +147,7 @@ private:
     std::array<std::array<ReverbLine, 6>, 2> reverbLines;
 
     std::array<float, 2> toneStates {};
+    std::array<float, 2> toneStates2 {};
     std::array<float, 2> reverbWetStates {};
     std::array<float, 2> phaseOffsets { 0.0f, juce::MathConstants<float>::pi };
     double currentSampleRate = 44100.0;
