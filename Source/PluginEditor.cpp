@@ -55,15 +55,187 @@ void ResamplingDelayAudioProcessorEditor::KnobLookAndFeel::drawRotarySlider (juc
     g.fillEllipse (thumbPoint.x - thumbRadius, thumbPoint.y - thumbRadius, thumbRadius * 2.0f, thumbRadius * 2.0f);
 
     const auto dotRadius = juce::jmax (4.0f, lineWidth * 0.48f);
-    const auto dotColour = slider.findColour (juce::Slider::rotarySliderFillColourId);
-    g.setColour (dotColour.withAlpha ((juce::uint8) 0x44));
+    const auto* modSlider = dynamic_cast<ResamplingDelayAudioProcessorEditor::ModSlider*> (&slider);
+    const auto hasScript = modSlider != nullptr && modSlider->hasScript;
+    const auto scriptActive = modSlider != nullptr && modSlider->scriptActive;
+    const auto dotColour = scriptActive ? juce::Colour (0xff42c7ff)
+                                        : (hasScript ? juce::Colour (0xff276ea7) : juce::Colour (0xff193449));
+    const auto glowAlpha = scriptActive ? 0x66 : (hasScript ? 0x30 : 0x14);
+
+    g.setColour (dotColour.withAlpha ((juce::uint8) glowAlpha));
     g.fillEllipse (centre.x - dotRadius * 3.1f, centre.y - dotRadius * 3.1f, dotRadius * 6.2f, dotRadius * 6.2f);
-    g.setColour (dotColour.brighter (0.08f));
+    g.setColour (dotColour.brighter (scriptActive ? 0.18f : 0.02f));
     g.fillEllipse (centre.x - dotRadius, centre.y - dotRadius, dotRadius * 2.0f, dotRadius * 2.0f);
-    g.setColour (juce::Colour (0xaaffffff));
+    g.setColour (scriptActive ? juce::Colour (0xccffffff) : juce::Colour (0x55ffffff));
     g.fillEllipse (centre.x - dotRadius * 0.40f, centre.y - dotRadius * 0.48f, dotRadius * 0.58f, dotRadius * 0.42f);
     g.setColour (juce::Colour (0x66000000));
     g.drawEllipse (centre.x - dotRadius, centre.y - dotRadius, dotRadius * 2.0f, dotRadius * 2.0f, 1.0f);
+}
+
+void ResamplingDelayAudioProcessorEditor::ModSlider::mouseDown (const juce::MouseEvent& event)
+{
+    const auto bounds = getLocalBounds().toFloat().reduced (4.0f);
+    const auto centre = bounds.getCentre();
+    const auto dotRadius = juce::jmax (10.0f, juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.055f);
+
+    if (event.position.getDistanceFrom (centre) <= dotRadius * 1.6f && onDotClicked != nullptr)
+    {
+        if (event.getNumberOfClicks() >= 2 && onDotDoubleClicked != nullptr)
+            onDotDoubleClicked();
+        else
+            onDotClicked();
+
+        return;
+    }
+
+    if (onManualDragStarted != nullptr)
+        onManualDragStarted();
+
+    juce::Slider::mouseDown (event);
+}
+
+namespace
+{
+class FabricScriptComponent final : public juce::Component
+{
+public:
+    FabricScriptComponent (ResamplingDelayAudioProcessor& processorIn,
+                           juce::String parameterIdIn,
+                           juce::String parameterNameIn)
+        : processor (processorIn),
+          parameterId (std::move (parameterIdIn)),
+          parameterName (std::move (parameterNameIn))
+    {
+        title.setText ("Fabric envelope: " + parameterName, juce::dontSendNotification);
+        title.setFont (juce::FontOptions (18.0f, juce::Font::bold));
+        title.setColour (juce::Label::textColourId, juce::Colour (0xfff4f7fb));
+        addAndMakeVisible (title);
+
+        script.setMultiLine (true);
+        script.setReturnKeyStartsNewLine (true);
+        script.setScrollbarsShown (true);
+        script.setFont (juce::FontOptions (14.0f));
+        script.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff0c1116));
+        script.setColour (juce::TextEditor::textColourId, juce::Colour (0xffeef5ff));
+        script.setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff26323d));
+        script.setText (processor.getFabricScriptForParameter (parameterId).isEmpty()
+            ? defaultScript()
+            : processor.getFabricScriptForParameter (parameterId));
+        addAndMakeVisible (script);
+
+        help.setText ("Commands: to 80%, random 20% 80%, hold, sine 10% 90%, wander 20% 80%.",
+                      juce::dontSendNotification);
+        help.setFont (juce::FontOptions (13.0f));
+        help.setColour (juce::Label::textColourId, juce::Colour (0xff8f9aa5));
+        help.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (help);
+
+        depthLabel.setText ("Depth", juce::dontSendNotification);
+        depthLabel.setFont (juce::FontOptions (13.0f));
+        depthLabel.setColour (juce::Label::textColourId, juce::Colour (0xffb8c4ce));
+        depthLabel.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (depthLabel);
+
+        depth.setSliderStyle (juce::Slider::LinearHorizontal);
+        depth.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 20);
+        depth.setRange (0.0, 1.0, 0.001);
+        depth.setValue (processor.getFabricScriptDepth (parameterId), juce::dontSendNotification);
+        depth.setColour (juce::Slider::trackColourId, juce::Colour (0xff42c7ff));
+        depth.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff24313b));
+        depth.setColour (juce::Slider::thumbColourId, juce::Colour (0xffeef5ff));
+        depth.setColour (juce::Slider::textBoxTextColourId, juce::Colour (0xffdce7ef));
+        depth.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
+        depth.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+        addAndMakeVisible (depth);
+
+        error.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        error.setColour (juce::Label::textColourId, juce::Colour (0xffff6f61));
+        error.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (error);
+
+        apply.setButtonText ("Apply");
+        apply.onClick = [this]
+        {
+            const auto validationError = processor.validateFabricScript (script.getText());
+            if (validationError.isNotEmpty())
+            {
+                error.setText (validationError, juce::dontSendNotification);
+                return;
+            }
+
+            processor.setFabricScriptForParameter (parameterId, script.getText());
+            processor.setFabricScriptDepth (parameterId, (float) depth.getValue());
+            if (auto* window = findParentComponentOfClass<juce::DialogWindow>())
+                window->exitModalState (0);
+        };
+        addAndMakeVisible (apply);
+
+        clear.setButtonText ("Clear");
+        clear.onClick = [this]
+        {
+            processor.setFabricScriptForParameter (parameterId, {});
+            if (auto* window = findParentComponentOfClass<juce::DialogWindow>())
+                window->exitModalState (0);
+        };
+        addAndMakeVisible (clear);
+
+        cancel.setButtonText ("Cancel");
+        cancel.onClick = [this]
+        {
+            if (auto* window = findParentComponentOfClass<juce::DialogWindow>())
+                window->exitModalState (0);
+        };
+        addAndMakeVisible (cancel);
+
+        setSize (620, 470);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (18);
+        title.setBounds (area.removeFromTop (30));
+        help.setBounds (area.removeFromBottom (30));
+        error.setBounds (area.removeFromBottom (28));
+        auto buttons = area.removeFromBottom (42);
+        apply.setBounds (buttons.removeFromRight (94).reduced (4));
+        clear.setBounds (buttons.removeFromRight (94).reduced (4));
+        cancel.setBounds (buttons.removeFromRight (94).reduced (4));
+        auto depthArea = area.removeFromBottom (34);
+        depthLabel.setBounds (depthArea.removeFromLeft (58));
+        depth.setBounds (depthArea.reduced (0, 4));
+        script.setBounds (area.reduced (0, 8));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff0e1419));
+    }
+
+private:
+    juce::String defaultScript() const
+    {
+        return "modulator " + parameterId + "\n"
+               "  mode loop\n"
+               "  stage 1 random 20% 80% for 700ms curve smooth\n"
+               "  stage 2 hold for 300ms\n"
+               "  stage 3 sine 10% 90% for 2s\n"
+               "  stage 4 wander 25% 75% for 900ms curve smooth\n"
+               "end\n";
+    }
+
+    ResamplingDelayAudioProcessor& processor;
+    juce::String parameterId;
+    juce::String parameterName;
+    juce::Label title;
+    juce::Label help;
+    juce::Label depthLabel;
+    juce::Label error;
+    juce::TextEditor script;
+    juce::Slider depth;
+    juce::TextButton apply;
+    juce::TextButton clear;
+    juce::TextButton cancel;
+};
 }
 
 ResamplingDelayAudioProcessorEditor::ResamplingDelayAudioProcessorEditor (ResamplingDelayAudioProcessor& p)
@@ -90,12 +262,12 @@ ResamplingDelayAudioProcessorEditor::ResamplingDelayAudioProcessorEditor (Resamp
     modeBox.setColour (juce::ComboBox::arrowColourId, juce::Colour (0xff42c7ff));
     addAndMakeVisible (modeBox);
 
-    configureSlider (delaySlider, " ms");
-    configureSlider (feedbackSlider);
-    configureSlider (reverbSlider, " s");
-    configureSlider (mixSlider);
-    configureSlider (lofiSlider);
-    configureSlider (toneSlider);
+    configureSlider (delaySlider, "delayMs", "Echo Time", " ms");
+    configureSlider (feedbackSlider, "feedback", "Repeats");
+    configureSlider (reverbSlider, "reverbTime", "Decay", " s");
+    configureSlider (mixSlider, "mix", "Dry/Wet");
+    configureSlider (lofiSlider, "lofi", "Wear");
+    configureSlider (toneSlider, "tone", "Tone");
 
     configureLabel (modeLabel, "Mode");
     configureLabel (delayLabel, "Echo Time");
@@ -121,6 +293,7 @@ ResamplingDelayAudioProcessorEditor::ResamplingDelayAudioProcessorEditor (Resamp
     toneAttachment = std::make_unique<Attachment> (audioProcessor.getState(), "tone", toneSlider);
 
     setSize (960, 500);
+    startTimerHz (30);
 }
 
 ResamplingDelayAudioProcessorEditor::~ResamplingDelayAudioProcessorEditor()
@@ -129,11 +302,14 @@ ResamplingDelayAudioProcessorEditor::~ResamplingDelayAudioProcessorEditor()
         slider->setLookAndFeel (nullptr);
 }
 
-void ResamplingDelayAudioProcessorEditor::configureSlider (juce::Slider& slider, const juce::String& suffix)
+void ResamplingDelayAudioProcessorEditor::configureSlider (ModSlider& slider,
+                                                           const juce::String& parameterId,
+                                                           const juce::String& parameterName,
+                                                           const juce::String& suffix)
 {
     slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
     slider.setLookAndFeel (&knobLookAndFeel);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 78, 20);
+    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 74, 18);
     slider.setTextValueSuffix (suffix);
     slider.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff6ce0c7));
     slider.setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colour (0xff252a2d));
@@ -141,6 +317,12 @@ void ResamplingDelayAudioProcessorEditor::configureSlider (juce::Slider& slider,
     slider.setColour (juce::Slider::textBoxTextColourId, juce::Colour (0xfff0f3f4));
     slider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
     slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    slider.onDotClicked = [this, parameterId]
+    {
+        audioProcessor.setFabricScriptActive (parameterId, ! audioProcessor.isFabricScriptActive (parameterId));
+    };
+    slider.onDotDoubleClicked = [this, parameterId, parameterName] { openFabricScriptEditor (parameterId, parameterName); };
+    slider.onManualDragStarted = [this, parameterId] { audioProcessor.setFabricScriptActive (parameterId, false); };
     addAndMakeVisible (slider);
 }
 
@@ -149,14 +331,64 @@ void ResamplingDelayAudioProcessorEditor::configureLabel (juce::Label& label, co
     label.setText (text, juce::dontSendNotification);
     label.setJustificationType (juce::Justification::centred);
     label.setColour (juce::Label::textColourId, juce::Colour (0xffdbe4e4));
-    label.setFont (juce::FontOptions (13.5f, juce::Font::bold));
+    label.setFont (juce::FontOptions (13.0f, juce::Font::bold));
     addAndMakeVisible (label);
 }
 
-void ResamplingDelayAudioProcessorEditor::setSliderAccent (juce::Slider& slider, juce::Colour accent)
+void ResamplingDelayAudioProcessorEditor::setSliderAccent (ModSlider& slider, juce::Colour accent)
 {
     slider.setColour (juce::Slider::rotarySliderFillColourId, accent);
     slider.setColour (juce::Slider::rotarySliderOutlineColourId, accent.withAlpha (0.18f));
+}
+
+void ResamplingDelayAudioProcessorEditor::openFabricScriptEditor (const juce::String& parameterId, const juce::String& parameterName)
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Fabric Script";
+    options.dialogBackgroundColour = juce::Colour (0xff20262b);
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = false;
+    options.content.setOwned (new FabricScriptComponent (audioProcessor, parameterId, parameterName));
+    options.launchAsync();
+}
+
+void ResamplingDelayAudioProcessorEditor::timerCallback()
+{
+    updateScriptIndicator (delaySlider, "delayMs");
+    updateScriptIndicator (feedbackSlider, "feedback");
+    updateScriptIndicator (reverbSlider, "reverbTime");
+    updateScriptIndicator (mixSlider, "mix");
+    updateScriptIndicator (lofiSlider, "lofi");
+    updateScriptIndicator (toneSlider, "tone");
+
+    updateModulatedSlider (delaySlider, "delayMs");
+    updateModulatedSlider (feedbackSlider, "feedback");
+    updateModulatedSlider (reverbSlider, "reverbTime");
+    updateModulatedSlider (mixSlider, "mix");
+    updateModulatedSlider (lofiSlider, "lofi");
+    updateModulatedSlider (toneSlider, "tone");
+}
+
+void ResamplingDelayAudioProcessorEditor::updateScriptIndicator (ModSlider& slider, const juce::String& parameterId)
+{
+    const auto hasScript = audioProcessor.parameterHasFabricScript (parameterId);
+    const auto scriptActive = audioProcessor.isFabricScriptActive (parameterId);
+
+    if (slider.hasScript != hasScript || slider.scriptActive != scriptActive)
+    {
+        slider.hasScript = hasScript;
+        slider.scriptActive = scriptActive;
+        slider.repaint();
+    }
+}
+
+void ResamplingDelayAudioProcessorEditor::updateModulatedSlider (ModSlider& slider, const juce::String& parameterId)
+{
+    if (! audioProcessor.isFabricScriptActive (parameterId) || slider.isMouseButtonDown())
+        return;
+
+    slider.setValue (audioProcessor.getCurrentModulatedParameterValue (parameterId), juce::dontSendNotification);
 }
 
 void ResamplingDelayAudioProcessorEditor::paint (juce::Graphics& g)
@@ -200,12 +432,13 @@ void ResamplingDelayAudioProcessorEditor::paint (juce::Graphics& g)
     g.setGradientFill (glossGradient);
     g.fillRoundedRectangle (gloss, 8.0f);
 
-    auto content = getLocalBounds().reduced (38, 30);
+    auto content = getLocalBounds().reduced (42, 32);
     content.removeFromTop (48);
-    content.removeFromTop (12);
-    auto upperWell = content.removeFromTop (168).toFloat().reduced (6.0f, 3.0f);
-    auto lowerWell = content.removeFromTop (168).toFloat().reduced (6.0f, 3.0f);
-    auto combinedWell = upperWell.getUnion (lowerWell).expanded (2.0f, 4.0f);
+    content.removeFromTop (18);
+    auto upperWell = content.removeFromTop (158).toFloat().reduced (4.0f, 2.0f);
+    content.removeFromTop (16);
+    auto lowerWell = content.removeFromTop (158).toFloat().reduced (4.0f, 2.0f);
+    auto combinedWell = upperWell.getUnion (lowerWell).expanded (2.0f, 5.0f);
 
     juce::ColourGradient wellGradient (juce::Colour (0x70070b10), combinedWell.getTopLeft(),
                                        juce::Colour (0x96030406), combinedWell.getBottomRight(), false);
@@ -224,6 +457,15 @@ void ResamplingDelayAudioProcessorEditor::paint (juce::Graphics& g)
     g.setGradientFill (rowSheen);
     g.fillRoundedRectangle (lowerWell.withHeight (lowerWell.getHeight() * 0.30f), 8.0f);
 
+    auto rowGap = juce::Rectangle<float> (combinedWell.getX() + 12.0f,
+                                          upperWell.getBottom() + 4.0f,
+                                          combinedWell.getWidth() - 24.0f,
+                                          lowerWell.getY() - upperWell.getBottom() - 8.0f);
+    g.setColour (juce::Colour (0x24000000));
+    g.fillRoundedRectangle (rowGap, 3.0f);
+    g.setColour (juce::Colour (0x13ffffff));
+    g.drawLine (rowGap.getX() + 8.0f, rowGap.getCentreY(), rowGap.getRight() - 8.0f, rowGap.getCentreY(), 1.0f);
+
     juce::ColourGradient bottomShade (juce::Colours::transparentBlack, panel.getCentreX(), panel.getY() + panel.getHeight() * 0.35f,
                                       juce::Colour (0x74000000), panel.getCentreX(), panel.getBottom(), false);
     g.setGradientFill (bottomShade);
@@ -235,7 +477,7 @@ void ResamplingDelayAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0x38000000));
     g.drawRoundedRectangle (panel.reduced (1.5f), 7.0f, 1.2f);
 
-    auto display = juce::Rectangle<float> (panel.getCentreX() - 124.0f, panel.getY() + 25.0f, 248.0f, 28.0f);
+    auto display = juce::Rectangle<float> (panel.getCentreX() - 112.0f, panel.getY() + 25.0f, 224.0f, 28.0f);
     juce::ColourGradient displayGlass (juce::Colour (0x22000000), display.getTopLeft(),
                                        juce::Colour (0x46000000), display.getBottomRight(), false);
     g.setGradientFill (displayGlass);
@@ -243,60 +485,45 @@ void ResamplingDelayAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0x18ffffff));
     g.drawRoundedRectangle (display, 10.0f, 0.8f);
 
-    auto meter = juce::Rectangle<float> (display.getCentreX() - 104.0f, display.getCentreY() - 4.5f, 208.0f, 9.0f);
-    g.setColour (juce::Colour (0x34000000));
-    g.fillRoundedRectangle (meter, 4.0f);
-    g.setColour (juce::Colour (0x24ffffff));
-    g.drawRoundedRectangle (meter, 4.0f, 0.7f);
-
-    auto meterInner = meter.reduced (4.0f, 3.0f);
-    auto leftMeter = meterInner.removeFromLeft ((meterInner.getWidth() - 4.0f) * 0.5f);
-    meterInner.removeFromLeft (4.0f);
-    auto rightMeter = meterInner;
-    auto centreLine = meter.withWidth (1.0f).withCentre (meter.getCentre());
-    g.setColour (juce::Colour (0x36d7ecff));
-    g.fillRect (centreLine);
-
-    g.setColour (juce::Colour (0xff42c7ff).withAlpha (0.56f));
-    g.fillRoundedRectangle (leftMeter.withTrimmedLeft (leftMeter.getWidth() * 0.26f), 3.0f);
-    g.fillRoundedRectangle (rightMeter.withTrimmedRight (rightMeter.getWidth() * 0.18f), 3.0f);
-    g.setColour (juce::Colour (0xffeef5ff).withAlpha (0.62f));
-    g.fillEllipse (meter.getCentreX() + 28.0f, meter.getCentreY() - 2.4f, 4.8f, 4.8f);
+    g.setColour (juce::Colour (0x1fd7ecff));
+    g.drawLine (display.getX() + 28.0f, display.getCentreY(), display.getRight() - 28.0f, display.getCentreY(), 1.0f);
 }
 
 void ResamplingDelayAudioProcessorEditor::resized()
 {
-    auto area = getLocalBounds().reduced (38, 30);
+    auto area = getLocalBounds().reduced (42, 32);
     auto header = area.removeFromTop (48);
-    titleLabel.setBounds (header.removeFromLeft (360));
-    subtitleLabel.setBounds (header);
+    titleLabel.setBounds (header.removeFromLeft (332));
+    subtitleLabel.setBounds (header.removeFromRight (210));
 
-    area.removeFromTop (12);
+    area.removeFromTop (18);
 
-    auto upper = area.removeFromTop (168);
-    auto lower = area.removeFromTop (168);
+    auto upper = area.removeFromTop (158);
+    area.removeFromTop (16);
+    auto lower = area.removeFromTop (158);
 
     const auto layoutSlider = [] (juce::Slider& slider, juce::Label& label, juce::Rectangle<int> bounds)
     {
-        label.setBounds (bounds.removeFromTop (24));
-        slider.setBounds (bounds);
+        label.setBounds (bounds.removeFromTop (22));
+        slider.setBounds (bounds.reduced (0, 1));
     };
 
     const auto layoutMode = [this] (juce::Rectangle<int> bounds)
     {
-        modeLabel.setBounds (bounds.removeFromTop (24));
-        modeBox.setBounds (bounds.reduced (16, 50));
+        modeLabel.setBounds (bounds.removeFromTop (22));
+        modeBox.setBounds (bounds.withSizeKeepingCentre (142, 32));
     };
 
     const auto upperWidth = upper.getWidth() / 4;
-    layoutMode (upper.removeFromLeft (upperWidth).reduced (8));
-    layoutSlider (delaySlider, delayLabel, upper.removeFromLeft (upperWidth).reduced (8));
-    layoutSlider (feedbackSlider, feedbackLabel, upper.removeFromLeft (upperWidth).reduced (8));
-    layoutSlider (mixSlider, mixLabel, upper.reduced (8));
+    layoutMode (upper.removeFromLeft (upperWidth).reduced (12, 5));
+    layoutSlider (delaySlider, delayLabel, upper.removeFromLeft (upperWidth).reduced (12, 5));
+    layoutSlider (feedbackSlider, feedbackLabel, upper.removeFromLeft (upperWidth).reduced (12, 5));
+    layoutSlider (mixSlider, mixLabel, upper.reduced (12, 5));
 
-    const auto lowerWidth = lower.getWidth() / 5;
-    lower.removeFromLeft (lowerWidth);
-    layoutSlider (reverbSlider, reverbLabel, lower.removeFromLeft (lowerWidth).reduced (8));
-    layoutSlider (lofiSlider, lofiLabel, lower.removeFromLeft (lowerWidth).reduced (8));
-    layoutSlider (toneSlider, toneLabel, lower.removeFromLeft (lowerWidth).reduced (8));
+    const auto lowerCellWidth = upperWidth;
+    const auto lowerControlsWidth = lowerCellWidth * 3;
+    auto lowerControls = lower.withSizeKeepingCentre (lowerControlsWidth, lower.getHeight());
+    layoutSlider (reverbSlider, reverbLabel, lowerControls.removeFromLeft (lowerCellWidth).reduced (12, 5));
+    layoutSlider (lofiSlider, lofiLabel, lowerControls.removeFromLeft (lowerCellWidth).reduced (12, 5));
+    layoutSlider (toneSlider, toneLabel, lowerControls.reduced (12, 5));
 }

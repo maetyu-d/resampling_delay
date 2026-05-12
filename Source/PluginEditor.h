@@ -5,7 +5,8 @@
 
 #include "PluginProcessor.h"
 
-class ResamplingDelayAudioProcessorEditor final : public juce::AudioProcessorEditor
+class ResamplingDelayAudioProcessorEditor final : public juce::AudioProcessorEditor,
+                                                  private juce::Timer
 {
 public:
     explicit ResamplingDelayAudioProcessorEditor (ResamplingDelayAudioProcessor&);
@@ -31,20 +32,35 @@ private:
                                juce::Slider&) override;
     };
 
-    void configureSlider (juce::Slider& slider, const juce::String& suffix = {});
+    struct ModSlider final : public juce::Slider
+    {
+        bool hasScript = false;
+        bool scriptActive = false;
+        std::function<void()> onDotClicked;
+        std::function<void()> onDotDoubleClicked;
+        std::function<void()> onManualDragStarted;
+
+        void mouseDown (const juce::MouseEvent&) override;
+    };
+
+    void configureSlider (ModSlider& slider, const juce::String& parameterId, const juce::String& parameterName, const juce::String& suffix = {});
     void configureLabel (juce::Label& label, const juce::String& text);
-    void setSliderAccent (juce::Slider& slider, juce::Colour accent);
+    void setSliderAccent (ModSlider& slider, juce::Colour accent);
+    void openFabricScriptEditor (const juce::String& parameterId, const juce::String& parameterName);
+    void timerCallback() override;
+    void updateScriptIndicator (ModSlider& slider, const juce::String& parameterId);
+    void updateModulatedSlider (ModSlider& slider, const juce::String& parameterId);
 
     ResamplingDelayAudioProcessor& audioProcessor;
     KnobLookAndFeel knobLookAndFeel;
 
     juce::ComboBox modeBox;
-    juce::Slider delaySlider;
-    juce::Slider feedbackSlider;
-    juce::Slider reverbSlider;
-    juce::Slider mixSlider;
-    juce::Slider lofiSlider;
-    juce::Slider toneSlider;
+    ModSlider delaySlider;
+    ModSlider feedbackSlider;
+    ModSlider reverbSlider;
+    ModSlider mixSlider;
+    ModSlider lofiSlider;
+    ModSlider toneSlider;
 
     juce::Label titleLabel;
     juce::Label subtitleLabel;

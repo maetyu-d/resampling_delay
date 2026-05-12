@@ -7,6 +7,9 @@ namespace
 {
 constexpr float maxDelaySeconds = 4.0f;
 constexpr float maxReverbSeconds = 6.0f;
+constexpr std::array<const char*, 6> parameterIds {
+    "delayMs", "feedback", "reverbTime", "mix", "lofi", "tone"
+};
 
 float softClip (float x)
 {
@@ -22,6 +25,216 @@ float equalPowerWet (float mix)
 {
     return std::sin (juce::MathConstants<float>::halfPi * mix);
 }
+
+float parseTimeToSeconds (const juce::String& token)
+{
+    const auto text = token.trim().toLowerCase();
+    if (text.endsWith ("ms"))
+        return text.dropLastCharacters (2).getFloatValue() * 0.001f;
+    if (text.endsWithChar ('s'))
+        return text.dropLastCharacters (1).getFloatValue();
+
+    return text.getFloatValue();
+}
+
+float parseLevel (const juce::String& token)
+{
+    const auto text = token.trim();
+    if (text.endsWithChar ('%'))
+        return juce::jlimit (0.0f, 1.0f, text.dropLastCharacters (1).getFloatValue() * 0.01f);
+
+    return juce::jlimit (0.0f, 1.0f, text.getFloatValue());
+}
+
+bool looksLikeNumberOrPercent (const juce::String& token)
+{
+    const auto text = token.trim();
+    if (text.isEmpty())
+        return false;
+
+    const auto numeric = text.endsWithChar ('%') ? text.dropLastCharacters (1) : text;
+    return numeric.containsOnly ("0123456789.+-");
+}
+}
+
+juce::String ResamplingDelayAudioProcessor::ParameterModulation::setScript (const juce::String& newScript, double sampleRate)
+{
+    script = newScript;
+    stages.clear();
+    loop = true;
+    active = false;
+    stage = 0;
+    sample = 0;
+    initialised = false;
+
+    juce::StringArray lines;
+    lines.addLines (newScript);
+
+    for (int lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
+    {
+        auto line = lines[lineIndex].upToFirstOccurrenceOf ("#", false, false).trim();
+        if (line.isEmpty())
+            continue;
+
+        juce::StringArray tokens;
+        tokens.addTokens (line, " \t", "\"'");
+        tokens.removeEmptyStrings();
+
+        if (tokens.size() == 0)
+            continue;
+
+        const auto lineError = [&] (const juce::String& message)
+        {
+            return "Line " + juce::String (lineIndex + 1) + ": " + message;
+        };
+
+        if (tokens[0].equalsIgnoreCase ("modulator") || tokens[0].equalsIgnoreCase ("end"))
+            continue;
+
+        if (tokens[0].equalsIgnoreCase ("mode") && tokens.size() > 1)
+        {
+            loop = ! tokens[1].equalsIgnoreCase ("one_shot");
+            continue;
+        }
+
+        const auto isStageLine = tokens[0].equalsIgnoreCase ("stage");
+        const auto commandIndex = isStageLine ? 2 : 0;
+        if (isStageLine && tokens.size() < 3)
+            return lineError ("stage needs a command, for example 'stage 1 to 80% for 1s'.");
+
+        if (commandIndex >= tokens.size())
+            return lineError ("missing command.");
+
+        const auto command = tokens[commandIndex].toLowerCase();
+        if (! (command == "to" || command == "hold" || command == "random" || command == "sine" || command == "wander"))
+            return lineError ("unknown command '" + tokens[commandIndex] + "'. Use to, hold, random, sine, or wander.");
+
+        ModStage next;
+        next.target = stages.empty() ? 1.0f : stages.back().target;
+        next.minimum = 0.0f;
+        next.maximum = 1.0f;
+        next.samples = (int) std::round (0.25 * sampleRate);
+        next.smooth = true;
+        int optionStart = commandIndex + 1;
+
+        if (command == "to")
+        {
+            if (optionStart >= tokens.size())
+                return lineError ("'to' needs a target value.");
+
+            if (tokens[optionStart].equalsIgnoreCase ("random"))
+            {
+                if (optionStart + 2 >= tokens.size())
+                    return lineError ("'to random' needs minimum and maximum values.");
+
+                next.type = ModStage::Type::random;
+                next.minimum = parseLevel (tokens[optionStart + 1]);
+                next.maximum = parseLevel (tokens[optionStart + 2]);
+                optionStart += 3;
+            }
+            else
+            {
+                if (! looksLikeNumberOrPercent (tokens[optionStart]))
+                    return lineError ("target value must be 0..1 or a percentage.");
+
+                next.type = ModStage::Type::ramp;
+                next.target = parseLevel (tokens[optionStart]);
+                optionStart += 1;
+            }
+        }
+        else if (command == "hold")
+        {
+            next.type = ModStage::Type::hold;
+        }
+        else
+        {
+            if (optionStart + 1 >= tokens.size())
+                return lineError ("'" + command + "' needs minimum and maximum values.");
+
+            if (! looksLikeNumberOrPercent (tokens[optionStart]) || ! looksLikeNumberOrPercent (tokens[optionStart + 1]))
+                return lineError ("'" + command + "' values must be 0..1 or percentages.");
+
+            next.type = command == "random" ? ModStage::Type::random
+                      : command == "sine"   ? ModStage::Type::sine
+                                            : ModStage::Type::wander;
+            next.minimum = parseLevel (tokens[optionStart]);
+            next.maximum = parseLevel (tokens[optionStart + 1]);
+            optionStart += 2;
+        }
+
+        if (next.minimum > next.maximum)
+            std::swap (next.minimum, next.maximum);
+
+        for (int i = optionStart; i < tokens.size(); ++i)
+        {
+            if ((tokens[i].equalsIgnoreCase ("for") || tokens[i].equalsIgnoreCase ("in")) && i + 1 < tokens.size())
+                next.samples = juce::jmax (1, (int) std::round (parseTimeToSeconds (tokens[++i]) * sampleRate));
+            else if (tokens[i].equalsIgnoreCase ("curve") && i + 1 < tokens.size())
+                next.smooth = ! tokens[++i].equalsIgnoreCase ("linear");
+            else
+                return lineError ("unexpected token '" + tokens[i] + "'.");
+        }
+
+        stages.push_back (next);
+    }
+
+    active = ! stages.empty();
+    return {};
+}
+
+float ResamplingDelayAudioProcessor::ParameterModulation::nextRandom()
+{
+    randomState = randomState * 1664525u + 1013904223u;
+    return (float) ((randomState >> 8) & 0x00ffffffu) / (float) 0x00ffffffu;
+}
+
+float ResamplingDelayAudioProcessor::ParameterModulation::process (float baseNormalised)
+{
+    if (stages.empty() || ! active)
+        return baseNormalised;
+
+    if (! initialised)
+    {
+        current = baseNormalised;
+        start = baseNormalised;
+        initialised = true;
+    }
+
+    auto& currentStage = stages[(size_t) stage];
+    if (sample == 0)
+    {
+        if (currentStage.type == ModStage::Type::random || currentStage.type == ModStage::Type::wander)
+            currentStage.target = juce::jmap (nextRandom(), currentStage.minimum, currentStage.maximum);
+        else if (currentStage.type == ModStage::Type::hold)
+            currentStage.target = start;
+    }
+
+    const auto progress = juce::jlimit (0.0f, 1.0f, (float) sample / (float) juce::jmax (1, currentStage.samples));
+    const auto shaped = currentStage.smooth ? progress * progress * (3.0f - 2.0f * progress) : progress;
+
+    if (currentStage.type == ModStage::Type::sine)
+    {
+        const auto phase = progress * juce::MathConstants<float>::twoPi;
+        const auto wave = 0.5f + 0.5f * std::sin (phase - juce::MathConstants<float>::halfPi);
+        current = juce::jmap (wave, currentStage.minimum, currentStage.maximum);
+    }
+    else
+    {
+        current = start + (currentStage.target - start) * shaped;
+    }
+
+    if (++sample >= currentStage.samples)
+    {
+        current = currentStage.target;
+        sample = 0;
+        start = current;
+
+        if (++stage >= (int) stages.size())
+            stage = loop ? 0 : (int) stages.size() - 1;
+    }
+
+    const auto modulated = juce::jlimit (0.0f, 1.0f, current);
+    return juce::jlimit (0.0f, 1.0f, baseNormalised + (modulated - baseNormalised) * depth);
 }
 
 ResamplingDelayAudioProcessor::ResamplingDelayAudioProcessor()
@@ -29,6 +242,9 @@ ResamplingDelayAudioProcessor::ResamplingDelayAudioProcessor()
                                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       state (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    for (auto& value : currentModulatedValues)
+        value.store (0.0f);
+
     mode = state.getRawParameterValue ("mode");
     delayMs = state.getRawParameterValue ("delayMs");
     feedback = state.getRawParameterValue ("feedback");
@@ -86,6 +302,12 @@ void ResamplingDelayAudioProcessor::prepareToPlay (double sampleRate, int)
     wowPhase = 0.0f;
     smoothedDelayMs = delayMs->load();
     smoothedReverbTime = reverbTime->load();
+    currentDelayMs = smoothedDelayMs;
+    currentFeedback = feedback->load();
+    currentReverbTime = smoothedReverbTime;
+    currentMix = mix->load();
+    currentLofi = lofi->load();
+    currentTone = tone->load();
 }
 
 void ResamplingDelayAudioProcessor::releaseResources()
@@ -108,6 +330,7 @@ void ResamplingDelayAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     for (int channel = getTotalNumInputChannels(); channel < getTotalNumOutputChannels(); ++channel)
         buffer.clear (channel, 0, buffer.getNumSamples());
 
+    processModulations (buffer.getNumSamples());
     updateSmoothedValues();
 
     if (mode->load() < 0.5f)
@@ -119,11 +342,11 @@ void ResamplingDelayAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 void ResamplingDelayAudioProcessor::processDelay (juce::AudioBuffer<float>& buffer)
 {
     const auto numChannels = juce::jmin (2, buffer.getNumChannels());
-    const auto mixValue = mix->load();
+    const auto mixValue = currentMix;
     const auto wetGain = equalPowerWet (mixValue);
     const auto dryGain = equalPowerDry (mixValue);
-    const auto fb = feedback->load();
-    const auto lofiAmount = lofi->load();
+    const auto fb = currentFeedback;
+    const auto lofiAmount = currentLofi;
     const auto wowDepthSamples = juce::jmap (lofiAmount, 1.0f, 48.0f);
     const auto wowRate = juce::jmap (lofiAmount, 0.08f, 0.75f);
 
@@ -146,7 +369,7 @@ void ResamplingDelayAudioProcessor::processDelay (juce::AudioBuffer<float>& buff
                                                         + wow + channelOffset);
 
             auto wet = delayLine.read (channel, delaySamples);
-            wet = toneFilter (channel, wet, tone->load());
+            wet = toneFilter (channel, wet, currentTone);
             wet = crush (channel, wet);
 
             const auto intoDelay = softClip (dry + wet * fb * juce::jmap (lofiAmount, 0.9f, 1.35f));
@@ -161,10 +384,10 @@ void ResamplingDelayAudioProcessor::processDelay (juce::AudioBuffer<float>& buff
 void ResamplingDelayAudioProcessor::processReverb (juce::AudioBuffer<float>& buffer)
 {
     const auto numChannels = juce::jmin (2, buffer.getNumChannels());
-    const auto mixValue = mix->load();
+    const auto mixValue = currentMix;
     const auto wetGain = equalPowerWet (mixValue);
     const auto dryGain = equalPowerDry (mixValue);
-    const auto lofiAmount = lofi->load();
+    const auto lofiAmount = currentLofi;
     const auto sizeScale = juce::jmap (smoothedReverbTime, 0.35f, maxReverbSeconds, 0.52f, 2.75f);
     const auto regen = juce::jlimit (0.2f, 0.94f, 0.38f + smoothedReverbTime * 0.082f + lofiAmount * 0.08f);
 
@@ -193,7 +416,7 @@ void ResamplingDelayAudioProcessor::processReverb (juce::AudioBuffer<float>& buf
 
                 const auto tap = line.delay.read (0, delaySamples);
                 const auto diffused = softClip (input + tap * regen - tank * 0.045f);
-                const auto degraded = crush (channel, toneFilter (channel, diffused, tone->load()));
+                const auto degraded = crush (channel, toneFilter (channel, diffused, currentTone));
                 line.delay.write (0, degraded);
                 line.delay.advance();
                 tank += tap * (i % 2 == 0 ? 1.0f : -0.72f);
@@ -223,8 +446,69 @@ void ResamplingDelayAudioProcessor::updateSmoothedValues()
 {
     const auto delayCoefficient = 1.0f - std::exp (-1.0f / (0.075f * static_cast<float> (currentSampleRate)));
     const auto reverbCoefficient = 1.0f - std::exp (-1.0f / (0.18f * static_cast<float> (currentSampleRate)));
-    smoothedDelayMs += delayCoefficient * (delayMs->load() - smoothedDelayMs);
-    smoothedReverbTime += reverbCoefficient * (reverbTime->load() - smoothedReverbTime);
+    smoothedDelayMs += delayCoefficient * (currentDelayMs - smoothedDelayMs);
+    smoothedReverbTime += reverbCoefficient * (currentReverbTime - smoothedReverbTime);
+}
+
+void ResamplingDelayAudioProcessor::processModulations (int numSamples)
+{
+    const auto samples = juce::jmax (1, numSamples);
+
+    for (int i = 0; i < samples; ++i)
+    {
+        juce::ignoreUnused (i);
+        currentDelayMs = processModulatedParameter (0, delayMs->load());
+        currentFeedback = processModulatedParameter (1, feedback->load());
+        currentReverbTime = processModulatedParameter (2, reverbTime->load());
+        currentMix = processModulatedParameter (3, mix->load());
+        currentLofi = processModulatedParameter (4, lofi->load());
+        currentTone = processModulatedParameter (5, tone->load());
+    }
+}
+
+int ResamplingDelayAudioProcessor::parameterIndexForId (const juce::String& parameterId)
+{
+    for (int i = 0; i < (int) parameterIds.size(); ++i)
+        if (parameterId == parameterIds[(size_t) i])
+            return i;
+
+    return -1;
+}
+
+float ResamplingDelayAudioProcessor::normaliseParameterValue (int parameterIndex, float value)
+{
+    switch (parameterIndex)
+    {
+        case 0: return juce::jmap (value, 35.0f, 1800.0f, 0.0f, 1.0f);
+        case 1: return juce::jmap (value, 0.0f, 0.96f, 0.0f, 1.0f);
+        case 2: return juce::jmap (value, 0.35f, maxReverbSeconds, 0.0f, 1.0f);
+        default: return juce::jlimit (0.0f, 1.0f, value);
+    }
+}
+
+float ResamplingDelayAudioProcessor::denormaliseParameterValue (int parameterIndex, float normalised)
+{
+    const auto value = juce::jlimit (0.0f, 1.0f, normalised);
+
+    switch (parameterIndex)
+    {
+        case 0: return juce::jmap (value, 35.0f, 1800.0f);
+        case 1: return juce::jmap (value, 0.0f, 0.96f);
+        case 2: return juce::jmap (value, 0.35f, maxReverbSeconds);
+        default: return value;
+    }
+}
+
+float ResamplingDelayAudioProcessor::processModulatedParameter (int parameterIndex, float baseValue)
+{
+    const juce::ScopedLock lock (modulationLock);
+    if (! juce::isPositiveAndBelow (parameterIndex, (int) parameterModulations.size()))
+        return baseValue;
+
+    const auto baseNormalised = normaliseParameterValue (parameterIndex, baseValue);
+    const auto modulatedValue = denormaliseParameterValue (parameterIndex, parameterModulations[(size_t) parameterIndex].process (baseNormalised));
+    currentModulatedValues[(size_t) parameterIndex].store (modulatedValue, std::memory_order_relaxed);
+    return modulatedValue;
 }
 
 void ResamplingDelayAudioProcessor::VariableDelay::prepare (double newSampleRate, int channels, double maxDelaySecondsToUse)
@@ -297,7 +581,24 @@ float ResamplingDelayAudioProcessor::SampleCrusher::process (int channel, float 
 
 void ResamplingDelayAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (auto xml = state.copyState().createXml())
+    auto savedState = state.copyState();
+    {
+        const juce::ScopedLock lock (modulationLock);
+        for (int i = 0; i < (int) parameterIds.size(); ++i)
+        {
+            savedState.setProperty ("fabricScript_" + juce::String (parameterIds[(size_t) i]),
+                                    parameterModulations[(size_t) i].script,
+                                    nullptr);
+            savedState.setProperty ("fabricScriptActive_" + juce::String (parameterIds[(size_t) i]),
+                                    parameterModulations[(size_t) i].active,
+                                    nullptr);
+            savedState.setProperty ("fabricScriptDepth_" + juce::String (parameterIds[(size_t) i]),
+                                    parameterModulations[(size_t) i].depth,
+                                    nullptr);
+        }
+    }
+
+    if (auto xml = savedState.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
@@ -305,7 +606,115 @@ void ResamplingDelayAudioProcessor::setStateInformation (const void* data, int s
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (state.state.getType()))
+        {
             state.replaceState (juce::ValueTree::fromXml (*xml));
+            for (int i = 0; i < (int) parameterIds.size(); ++i)
+            {
+                setFabricScriptForParameter (parameterIds[(size_t) i],
+                    state.state.getProperty ("fabricScript_" + juce::String (parameterIds[(size_t) i])).toString());
+                setFabricScriptActive (parameterIds[(size_t) i],
+                    (bool) state.state.getProperty ("fabricScriptActive_" + juce::String (parameterIds[(size_t) i]), true));
+                setFabricScriptDepth (parameterIds[(size_t) i],
+                    (float) state.state.getProperty ("fabricScriptDepth_" + juce::String (parameterIds[(size_t) i]), 1.0f));
+            }
+        }
+}
+
+void ResamplingDelayAudioProcessor::setFabricScriptForParameter (const juce::String& parameterId, const juce::String& script)
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return;
+
+    ParameterModulation parsed;
+    if (parsed.setScript (script, currentSampleRate).isNotEmpty())
+        return;
+
+    const juce::ScopedLock lock (modulationLock);
+    parsed.depth = parameterModulations[(size_t) index].depth;
+    parameterModulations[(size_t) index] = std::move (parsed);
+}
+
+juce::String ResamplingDelayAudioProcessor::validateFabricScript (const juce::String& script) const
+{
+    ParameterModulation parsed;
+    return parsed.setScript (script, currentSampleRate);
+}
+
+juce::String ResamplingDelayAudioProcessor::getFabricScriptForParameter (const juce::String& parameterId) const
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return {};
+
+    const juce::ScopedLock lock (modulationLock);
+    return parameterModulations[(size_t) index].script;
+}
+
+void ResamplingDelayAudioProcessor::setFabricScriptDepth (const juce::String& parameterId, float depth)
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return;
+
+    const juce::ScopedLock lock (modulationLock);
+    parameterModulations[(size_t) index].depth = juce::jlimit (0.0f, 1.0f, depth);
+}
+
+float ResamplingDelayAudioProcessor::getFabricScriptDepth (const juce::String& parameterId) const
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return 1.0f;
+
+    const juce::ScopedLock lock (modulationLock);
+    return parameterModulations[(size_t) index].depth;
+}
+
+void ResamplingDelayAudioProcessor::setFabricScriptActive (const juce::String& parameterId, bool active)
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return;
+
+    const juce::ScopedLock lock (modulationLock);
+    auto& modulation = parameterModulations[(size_t) index];
+    modulation.active = active && ! modulation.stages.empty();
+    if (modulation.active)
+    {
+        modulation.stage = 0;
+        modulation.sample = 0;
+        modulation.initialised = false;
+    }
+}
+
+bool ResamplingDelayAudioProcessor::isFabricScriptActive (const juce::String& parameterId) const
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return false;
+
+    const juce::ScopedLock lock (modulationLock);
+    return parameterModulations[(size_t) index].active && ! parameterModulations[(size_t) index].stages.empty();
+}
+
+float ResamplingDelayAudioProcessor::getCurrentModulatedParameterValue (const juce::String& parameterId) const
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) currentModulatedValues.size()))
+        return 0.0f;
+
+    return currentModulatedValues[(size_t) index].load (std::memory_order_relaxed);
+}
+
+bool ResamplingDelayAudioProcessor::parameterHasFabricScript (const juce::String& parameterId) const
+{
+    const auto index = parameterIndexForId (parameterId);
+    if (! juce::isPositiveAndBelow (index, (int) parameterModulations.size()))
+        return false;
+
+    const juce::ScopedLock lock (modulationLock);
+    return ! parameterModulations[(size_t) index].stages.empty();
 }
 
 juce::AudioProcessorEditor* ResamplingDelayAudioProcessor::createEditor()
